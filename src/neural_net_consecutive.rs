@@ -47,7 +47,65 @@ struct Connection {
 pub struct ConsecutiveNeuralNet {
     nodes: Vec<Node>,
     connections: Vec<Connection>,
-    sorted: bool,
+}
+
+fn connection_order(
+    connections: &[ConnectionTemplate],
+) -> Result<Vec<usize>, Error> {
+    let mut must_be_after = (0..connections.len())
+        .map(|j| {
+            let required_before = (0..connections.len())
+                .filter(|i| {
+                    let i = *i;
+                    let conn_i = &connections[i];
+                    let conn_j = &connections[j];
+
+                    // Avoid nonsensical dependencies
+                    let different_connection = i != j;
+
+                    // The origin of a normal connection has no unused
+                    // input connections.
+                    let after_input_conn = (conn_i.dest == conn_j.origin)
+                        && (conn_j.connection_type == ConnectionType::Normal);
+
+                    // The destination has no unused recurrent output
+                    // connections.
+                    let before_output_conn = (conn_i.origin == conn_j.dest)
+                        && (conn_i.connection_type
+                            == ConnectionType::Recurrent);
+
+                    different_connection
+                        && (after_input_conn || before_output_conn)
+                })
+                .collect::<Vec<_>>();
+
+            (j, required_before)
+        })
+        .collect::<HashMap<usize, Vec<usize>>>();
+
+    let mut output = Vec::new();
+
+    while must_be_after.len() > 0 {
+        let next_connection = must_be_after
+            .iter()
+            .filter(|(_k, v)| {
+                v.iter().all(|before| !must_be_after.contains_key(before))
+            })
+            .map(|(k, _v)| *k)
+            .next()
+            // If no connections can occur next, the network contains
+            // a loop of normal connections or a loop of recurrent
+            // connections..  A loop of normal connections is
+            // ill-defined.  A loop of recurrent connections is
+            // semantically valid, but isn't possible to represent
+            // with this representation.
+            .ok_or(Error::ConnectionLoop)?;
+
+        output.push(next_connection);
+        must_be_after.remove(&next_connection);
+    }
+
+    Ok(output)
 }
 
 impl ConsecutiveNeuralNet {
@@ -55,7 +113,6 @@ impl ConsecutiveNeuralNet {
         Self {
             nodes: Vec::new(),
             connections: Vec::new(),
-            sorted: false,
         }
     }
 
@@ -68,107 +125,46 @@ impl ConsecutiveNeuralNet {
                 n.value = NodeValue::Activated(*x);
             });
     }
-
-    fn connection_order(&self) -> Vec<usize> {
-        let mut must_be_after = (0..self.connections.len())
-            .map(|j| {
-                let required_before = (0..self.connections.len())
-                    .filter(|i| {
-                        let i = *i;
-                        let ref conn_i = self.connections[i];
-                        let ref conn_j = self.connections[j];
-
-                        // Avoid nonsensical dependencies
-                        let different_connection = i != j;
-
-                        // The origin of a normal connection has no unused
-                        // input connections.
-                        let after_input_conn = (conn_i.dest == conn_j.origin)
-                            && (conn_j.connection_type
-                                == ConnectionType::Normal);
-
-                        // The destination has no unused recurrent output
-                        // connections.
-                        let before_output_conn = (conn_i.origin == conn_j.dest)
-                            && (conn_i.connection_type
-                                == ConnectionType::Recurrent);
-
-                        different_connection
-                            && (after_input_conn || before_output_conn)
-                    })
-                    .collect::<Vec<_>>();
-
-                (j, required_before)
-            })
-            .collect::<HashMap<usize, Vec<usize>>>();
-
-        let mut output = Vec::new();
-
-        while must_be_after.len() > 0 {
-            let next_connection = must_be_after
-                .iter()
-                .filter(|(_k, v)| {
-                    v.iter().all(|before| !must_be_after.contains_key(before))
-                })
-                .map(|(k, _v)| *k)
-                .next()
-                // If this panics, we have a loop, which shouldn't be
-                // possible.
-                .unwrap();
-
-            output.push(next_connection);
-            must_be_after.remove(&next_connection);
-        }
-
-        output
-    }
-
-    fn sort_connections(&mut self) {
-        if self.sorted {
-            return;
-        }
-
-        self.connections = self
-            .connection_order()
-            .iter()
-            .map(|i| self.connections[*i])
-            .collect();
-
-        self.sorted = true;
-    }
 }
 
 impl NeuralNet for ConsecutiveNeuralNet {
-    fn add_node(&mut self, node_type: NodeType, func: ActivationFunction) {
-        self.nodes.push(Node {
-            value: NodeValue::Accumulator(0.0),
-            node_type,
-            func,
-        });
-    }
+    //fn build_from(&mut self, builder: NeuralNetBuilder) -> Result<(), Error> {
+    fn build_from(builder: &NeuralNetBuilder) -> Result<Self, Error> {
+        let nodes = builder
+            .nodes
+            .iter()
+            .map(|t| Node {
+                value: NodeValue::Accumulator(0.0),
+                node_type: t.node_type,
+                func: t.func,
+            })
+            .collect::<Vec<_>>();
 
-    fn add_connection(&mut self, origin: u32, dest: u32, weight: f32) {
-        assert!((origin as usize) < self.nodes.len());
-        assert!((dest as usize) < self.nodes.len());
+        let connections = connection_order(&builder.connections)?
+            .iter()
+            .map(|i| {
+                let template = builder
+                    .connections
+                    .get(*i)
+                    .ok_or(Error::InvalidConnectionIndex)?;
+                Ok(Connection {
+                    origin: template.origin,
+                    dest: template.dest,
+                    weight: template.weight,
+                    connection_type: template.connection_type,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-        // TODO: Verify that the connection added won't cause a loop.
-
-        self.connections.push(Connection {
-            origin,
-            dest,
-            weight,
-            connection_type: ConnectionType::Normal,
-        });
-        self.sorted = false;
+        Ok(Self { nodes, connections })
     }
 
     fn evaluate(&mut self, inputs: &[f32]) -> Vec<f32> {
-        self.sort_connections();
         self.load_input_values(&inputs);
 
         {
-            let ref mut connections = self.connections;
-            let ref mut nodes = self.nodes;
+            let connections = &mut self.connections;
+            let nodes = &mut self.nodes;
 
             connections.iter().for_each(|conn| {
                 let val = nodes[conn.origin as usize].get_val();
@@ -189,44 +185,53 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_simple_net() {
-        let mut net = ConsecutiveNeuralNet::new();
-        net.add_node(NodeType::Input, ActivationFunction::Identity);
-        net.add_node(NodeType::Input, ActivationFunction::Identity);
-        net.add_node(NodeType::Output, ActivationFunction::Identity);
-        net.add_connection(0, 2, 1.0);
-        net.add_connection(1, 2, -1.0);
+    fn test_simple_net() -> Result<(), Error> {
+        let mut net = NeuralNetBuilder::new()
+            .set_default_activation(ActivationFunction::Identity)
+            .add_nodes(NodeType::Input, 2)
+            .add_nodes(NodeType::Output, 1)
+            .add_normal_connection(0, 2, 1.0)
+            .add_normal_connection(1, 2, -1.0)
+            .build::<ConsecutiveNeuralNet>()?;
 
         let res = net.evaluate(&[0.5, 1.5]);
         assert_eq!(res.len(), 1);
         assert_eq!(res[0], -1.0);
+        Ok(())
     }
 
     #[test]
-    fn test_multilayered_net() {
+    fn test_multilayered_net() -> Result<(), Error> {
         let func = ActivationFunction::Sigmoid;
-        let mut net = ConsecutiveNeuralNet::new();
-        net.add_node(NodeType::Input, ActivationFunction::Identity);
-        net.add_node(NodeType::Hidden, func);
-        net.add_node(NodeType::Output, func);
-        // First connection added first
-        net.add_connection(0, 1, 1.0);
-        net.add_connection(1, 2, 1.0);
+        let mut net = NeuralNetBuilder::new()
+            .set_default_activation(func)
+            .add_nodes(NodeType::Input, 1)
+            .add_nodes(NodeType::Hidden, 1)
+            .add_nodes(NodeType::Output, 1)
+            // First connection added first, correct order of
+            // evaluation
+            .add_normal_connection(0, 1, 1.0)
+            .add_normal_connection(1, 2, 1.0)
+            .build::<ConsecutiveNeuralNet>()?;
 
         let res = net.evaluate(&[0.0]);
         assert_eq!(res.len(), 1);
         assert_eq!(res[0], func.apply(func.apply(0.0)));
 
-        let mut net = ConsecutiveNeuralNet::new();
-        net.add_node(NodeType::Input, ActivationFunction::Identity);
-        net.add_node(NodeType::Hidden, func);
-        net.add_node(NodeType::Output, func);
-        // Second connection added first, needs to be sorted.
-        net.add_connection(1, 2, 1.0);
-        net.add_connection(0, 1, 1.0);
+        let mut net = NeuralNetBuilder::new()
+            .set_default_activation(func)
+            .add_nodes(NodeType::Input, 1)
+            .add_nodes(NodeType::Hidden, 1)
+            .add_nodes(NodeType::Output, 1)
+            // Second connection added first, needs to be sorted.
+            .add_normal_connection(1, 2, 1.0)
+            .add_normal_connection(0, 1, 1.0)
+            .build::<ConsecutiveNeuralNet>()?;
 
         let res = net.evaluate(&[0.0]);
         assert_eq!(res.len(), 1);
         assert_eq!(res[0], func.apply(func.apply(0.0)));
+
+        Ok(())
     }
 }
