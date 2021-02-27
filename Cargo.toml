@@ -1,0 +1,17 @@
+[package]
+name = "entendre-rust"
+version = "0.1.0"
+authors = ["Eldritch Cheese <eldritch.cheese@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "entendre"
+path = "src/main.rs"
+
+[lib]
+name = "entendre"
+
+[dependencies]
+itertools = "*"
